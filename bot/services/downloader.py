@@ -1,4 +1,4 @@
-"""Media metadata extraction and downloading service powered by yt-dlp and ffmpeg."""
+"""Media metadata extraction and downloading service powered by yt-dlp, TikWM, and ffmpeg."""
 
 from __future__ import annotations
 
@@ -7,14 +7,16 @@ import json
 import re
 import shutil
 import subprocess
+import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import yt_dlp
 from loguru import logger
-from yt_dlp.utils import DownloadError
 
 from bot.config import settings
 
@@ -23,6 +25,31 @@ URL_REGEX = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 TARGET_RESOLUTIONS = (1080, 720, 480, 360)
 
 SINGLE_STREAM_PLATFORMS = {"TikTok", "Instagram", "Pinterest"}
+
+# In-memory TTL cache for extracted metadata/streams to avoid double scraping on button click
+_EXTRACTED_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_CACHE_TTL_SEC = 900.0  # 15 minutes
+
+
+def _cache_put(url: str, data: dict[str, Any]) -> None:
+    """Store extracted info in memory cache and prune expired entries."""
+    now = time.monotonic()
+    expired = [k for k, (ts, _) in _EXTRACTED_CACHE.items() if now - ts > _CACHE_TTL_SEC]
+    for k in expired:
+        _EXTRACTED_CACHE.pop(k, None)
+    _EXTRACTED_CACHE[url] = (now, data)
+
+
+def _cache_get(url: str) -> dict[str, Any] | None:
+    """Retrieve non-expired extracted info from memory cache."""
+    entry = _EXTRACTED_CACHE.get(url)
+    if not entry:
+        return None
+    ts, data = entry
+    if time.monotonic() - ts > _CACHE_TTL_SEC:
+        _EXTRACTED_CACHE.pop(url, None)
+        return None
+    return data
 
 
 class UserFriendlyDownloadError(Exception):
@@ -175,6 +202,7 @@ def translate_download_error(exc: Exception) -> UserFriendlyDownloadError:
             "sign in to confirm you’re not a bot",
             "sign in to confirm you're not a bot",
             "authentication",
+            "rate-limit reached",
         )
     ):
         return UserFriendlyDownloadError(
@@ -242,24 +270,19 @@ def translate_download_error(exc: Exception) -> UserFriendlyDownloadError:
 
 
 def _build_base_ydl_opts() -> dict[str, Any]:
-    """Construct base yt-dlp options including proxy and cookies if configured."""
+    """Construct fast, non-blocking yt-dlp options (IPv4 forced, native extractor headers)."""
     opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "geo_bypass": True,
-        "socket_timeout": 30,
+        "source_address": "0.0.0.0",  # Force IPv4 to prevent 20s IPv6 timeouts in Docker
+        "socket_timeout": 15,
         "retries": 3,
         "fragment_retries": 3,
-        "concurrent_fragment_downloads": 4,
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
-        },
+        "concurrent_fragment_downloads": 8,
+        "buffersize": 1024 * 64,
+        "http_chunk_size": 10485760,  # 10 MB chunks for faster CDN throughput
     }
     if settings.proxy_url.strip():
         opts["proxy"] = settings.proxy_url.strip()
@@ -271,6 +294,112 @@ def _build_base_ydl_opts() -> dict[str, Any]:
     return opts
 
 
+# ---------------------------------------------------------------------------
+# Fast TikTok Engine (TikWM API + Redirect Resolver)
+# ---------------------------------------------------------------------------
+def _resolve_short_redirect(url: str) -> str:
+    """Resolve short TikTok redirect links (/t/, vm.tiktok.com, vt.tiktok.com)."""
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+                )
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            final_url = resp.geturl()
+            if final_url and "tiktok.com" in final_url:
+                return final_url
+    except Exception as exc:
+        logger.debug("Short URL redirect resolution skipped for {}: {}", url, exc)
+    return url
+
+
+def _fetch_tikwm_info(url: str) -> dict[str, Any] | None:
+    """Fetch TikTok metadata and direct no-watermark stream URLs via TikWM API."""
+    try:
+        payload = urllib.parse.urlencode({"url": url, "hd": "1"}).encode("utf-8")
+        req = urllib.request.Request(
+            "https://www.tikwm.com/api/",
+            data=payload,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                "Accept": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            body = json.loads(resp.read().decode("utf-8", errors="replace"))
+        if body.get("code") != 0 or not body.get("data"):
+            logger.debug("TikWM returned non-zero code for {}: {}", url, body.get("msg"))
+            return None
+
+        data = body["data"]
+        play_url = data.get("play") or data.get("wmplay") or ""
+        hd_url = data.get("hdplay") or play_url
+        music_url = data.get("music") or (data.get("music_info") or {}).get("play") or ""
+
+        if play_url.startswith("/"):
+            play_url = urljoin("https://www.tikwm.com", play_url)
+        if hd_url.startswith("/"):
+            hd_url = urljoin("https://www.tikwm.com", hd_url)
+        if music_url.startswith("/"):
+            music_url = urljoin("https://www.tikwm.com", music_url)
+
+        if not play_url and not hd_url:
+            return None
+
+        author_info = data.get("author") or {}
+        uploader = (
+            author_info.get("nickname")
+            or author_info.get("unique_id")
+            or "TikTok"
+        )
+        title = str(data.get("title") or "TikTok Video").strip() or "TikTok Video"
+        if len(title) > 120:
+            title = title[:117] + "..."
+
+        return {
+            "_engine": "tikwm",
+            "id": str(data.get("id") or "tiktok"),
+            "title": title,
+            "uploader": str(uploader),
+            "duration": int(float(data.get("duration") or 0)),
+            "play_url": play_url,
+            "hd_url": hd_url,
+            "music_url": music_url,
+            "thumbnail": data.get("cover"),
+        }
+    except Exception as exc:
+        logger.warning("TikWM lookup failed for {}: {}", url, exc)
+        return None
+
+
+def _download_direct_http(stream_url: str, dest_path: Path) -> None:
+    """Download a direct media stream over HTTP with large buffer chunks."""
+    req = urllib.request.Request(
+        stream_url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://www.tiktok.com/",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp, dest_path.open("wb") as out_f:
+        while True:
+            chunk = resp.read(256 * 1024)
+            if not chunk:
+                break
+            out_f.write(chunk)
+
+
+# ---------------------------------------------------------------------------
+# Stream Size & Quality Helpers
+# ---------------------------------------------------------------------------
 def _estimate_stream_bytes(fmt: dict[str, Any], duration: int) -> int:
     """Estimate format size in bytes from filesize, filesize_approx, or bitrate."""
     exact = fmt.get("filesize") or fmt.get("filesize_approx")
@@ -295,7 +424,6 @@ def _extract_qualities(
 
     max_bytes = settings.max_file_size_bytes
 
-    # Find best audio stream size for adaptive (video-only) formats
     best_audio_bytes = 0
     for fmt in formats:
         vcodec = str(fmt.get("vcodec") or "none")
@@ -306,10 +434,8 @@ def _extract_qualities(
                 best_audio_bytes = a_size
 
     if best_audio_bytes == 0 and duration > 0:
-        # Assume ~128 kbps audio if not explicitly reported
         best_audio_bytes = int((128.0 * 1000.0 / 8.0) * duration)
 
-    # Map each target resolution to the best candidate video format
     best_per_target: dict[int, int] = {}
 
     for fmt in formats:
@@ -322,7 +448,6 @@ def _extract_qualities(
         if not isinstance(height, int) or height <= 0:
             continue
 
-        # Normalize resolution bucket using the shorter dimension for vertical videos
         short_side = min(width, height) if isinstance(width, int) and width > 0 else height
 
         matched_target: int | None = None
@@ -342,7 +467,6 @@ def _extract_qualities(
             continue
 
         prev = best_per_target.get(matched_target, 0)
-        # Prefer formats with known size, preferring H.264/MP4 within reasonable bounds
         if prev == 0 or (total_bytes > 0 and (prev == 0 or stream_bytes > 0)):
             if "avc1" in vcodec or "h264" in vcodec or prev == 0:
                 best_per_target[matched_target] = total_bytes
@@ -359,7 +483,27 @@ def _extract_qualities(
 
 
 def _sync_extract_metadata(url: str) -> MediaMetadata:
-    """Synchronously extract metadata via yt-dlp (intended to run in asyncio.to_thread)."""
+    """Synchronously extract metadata via TikWM (for TikTok) or yt-dlp."""
+    platform_guess = detect_platform(url)
+
+    # Fast path for TikTok (resolves /t/, vt.tiktok.com, vm.tiktok.com in <0.5s)
+    if platform_guess == "TikTok":
+        tikwm_data = _fetch_tikwm_info(url)
+        if tikwm_data:
+            _cache_put(url, tikwm_data)
+            return MediaMetadata(
+                url=url,
+                platform="TikTok",
+                title=tikwm_data["title"],
+                uploader=tikwm_data["uploader"],
+                duration=tikwm_data["duration"],
+                has_multiple_qualities=False,
+                qualities=[],
+                thumbnail_url=tikwm_data.get("thumbnail"),
+            )
+        # If TikWM didn't return data, pre-resolve short URL before passing to yt-dlp
+        url = _resolve_short_redirect(url)
+
     ydl_opts = _build_base_ydl_opts()
     ydl_opts["extract_flat"] = False
 
@@ -375,7 +519,6 @@ def _sync_extract_metadata(url: str) -> MediaMetadata:
             "⚠️ Не удалось получить метаданные по ссылке. Проверьте адрес."
         )
 
-    # Unwrap playlist / carousel entries if needed
     if info.get("_type") == "playlist" or "entries" in info:
         entries = [e for e in (info.get("entries") or []) if e]
         if not entries:
@@ -383,6 +526,9 @@ def _sync_extract_metadata(url: str) -> MediaMetadata:
                 "⚠️ Публикация не содержит доступных медиафайлов."
             )
         info = entries[0]
+
+    # Cache extracted yt-dlp info dict so clicking a button skips re-scraping
+    _cache_put(url, {"_engine": "ytdlp", "info": info})
 
     extractor = str(info.get("extractor_key") or info.get("extractor") or "")
     platform = detect_platform(url, extractor)
@@ -427,7 +573,7 @@ def _probe_media_file(file_path: Path) -> dict[str, Any]:
         str(file_path),
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
         if proc.returncode != 0 or not proc.stdout:
             return {}
         return json.loads(proc.stdout)
@@ -437,7 +583,10 @@ def _probe_media_file(file_path: Path) -> dict[str, Any]:
 
 
 def _ensure_h264_faststart_mp4(source_path: Path) -> tuple[Path, int, int, int]:
-    """Ensure the video file is MP4 (H.264 + AAC) with +faststart and return (path, w, h, dur)."""
+    """Ensure the video file is MP4 with +faststart and return (path, width, height, duration).
+
+    Avoids slow CPU re-encoding whenever the video is already H.264 or HEVC.
+    """
     probe = _probe_media_file(source_path)
     streams = probe.get("streams") or []
     fmt_info = probe.get("format") or {}
@@ -459,16 +608,17 @@ def _ensure_h264_faststart_mp4(source_path: Path) -> tuple[Path, int, int, int]:
         elif stype == "audio" and not acodec:
             acodec = str(stream.get("codec_name") or "").lower()
 
-    needs_video_reencode = vcodec not in ("h264", "avc1", "")
+    # H.264 and HEVC play natively on iOS/Android; only VP9/AV1 require transcoding
+    needs_video_reencode = vcodec not in ("h264", "avc1", "hevc", "h265", "")
     needs_audio_reencode = bool(acodec) and acodec not in ("aac", "mp4a", "mp3")
     is_mp4_ext = source_path.suffix.lower() == ".mp4"
 
     if not needs_video_reencode and not needs_audio_reencode and is_mp4_ext:
         return source_path, width, height, duration
 
-    converted_path = source_path.with_name(f"{source_path.stem}_h264.mp4")
+    converted_path = source_path.with_name(f"{source_path.stem}_fast.mp4")
     v_args = (
-        ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p"]
+        ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-pix_fmt", "yuv420p"]
         if needs_video_reencode
         else ["-c:v", "copy"]
     )
@@ -490,11 +640,12 @@ def _ensure_h264_faststart_mp4(source_path: Path) -> tuple[Path, int, int, int]:
         str(converted_path),
     ]
     logger.info(
-        "Normalizing video container/codecs (vcodec={}, acodec={}) -> H.264/AAC MP4",
+        "Remuxing/normalizing video (vcodec={}, acodec={}, reencode={})",
         vcodec,
         acodec,
+        needs_video_reencode,
     )
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1200, check=False)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900, check=False)
     if proc.returncode == 0 and converted_path.exists() and converted_path.stat().st_size > 0:
         source_path.unlink(missing_ok=True)
         reprobe = _probe_media_file(converted_path)
@@ -508,6 +659,63 @@ def _ensure_h264_faststart_mp4(source_path: Path) -> tuple[Path, int, int, int]:
     return source_path, width, height, duration
 
 
+def _download_via_tikwm(
+    tikwm_data: dict[str, Any],
+    choice: str,
+    temp_dir: Path,
+) -> DownloadedMedia:
+    """Download TikTok video or MP3 directly from TikWM CDN URLs."""
+    is_audio = choice == "audio"
+    vid_id = tikwm_data.get("id", "tiktok")
+
+    if is_audio:
+        music_url = tikwm_data.get("music_url") or tikwm_data.get("play_url")
+        if not music_url:
+            raise UserFriendlyDownloadError("⚠️ У этого ролика нет доступной аудиодорожки.")
+        raw_audio = temp_dir / f"media_{vid_id}_raw.mp3"
+        _download_direct_http(music_url, raw_audio)
+
+        # Ensure valid MP3 container via fast ffmpeg check
+        probe = _probe_media_file(raw_audio)
+        fmt_dur = (probe.get("format") or {}).get("duration")
+        duration = int(float(fmt_dur)) if fmt_dur else int(tikwm_data.get("duration") or 0)
+
+        return DownloadedMedia(
+            file_path=raw_audio,
+            temp_dir=temp_dir,
+            media_type="audio",
+            quality_label="MP3",
+            title=tikwm_data["title"][:100],
+            uploader=tikwm_data["uploader"][:64],
+            width=0,
+            height=0,
+            duration=duration,
+            file_size=raw_audio.stat().st_size,
+        )
+
+    # Prefer 'play_url' (always H.264 MP4 without watermark) for instant streaming
+    video_url = tikwm_data.get("play_url") or tikwm_data.get("hd_url")
+    if not video_url:
+        raise UserFriendlyDownloadError("⚠️ Не удалось получить поток видео без водяного знака.")
+
+    output_file = temp_dir / f"media_{vid_id}.mp4"
+    _download_direct_http(video_url, output_file)
+    output_file, width, height, duration = _ensure_h264_faststart_mp4(output_file)
+
+    return DownloadedMedia(
+        file_path=output_file,
+        temp_dir=temp_dir,
+        media_type="video",
+        quality_label="HD",
+        title=tikwm_data["title"][:100],
+        uploader=tikwm_data["uploader"][:64],
+        width=width or 720,
+        height=height or 1280,
+        duration=duration or int(tikwm_data.get("duration") or 0),
+        file_size=output_file.stat().st_size,
+    )
+
+
 def _sync_download_media(
     url: str,
     choice: str,
@@ -519,6 +727,19 @@ def _sync_download_media(
     temp_dir = settings.temp_downloads_dir / req_id
     temp_dir.mkdir(parents=True, exist_ok=True)
 
+    cached = _cache_get(url)
+
+    # 1. Fast path for TikTok via TikWM
+    if detect_platform(url) == "TikTok":
+        tikwm_data = cached if (cached and cached.get("_engine") == "tikwm") else _fetch_tikwm_info(url)
+        if tikwm_data:
+            try:
+                return _download_via_tikwm(tikwm_data, choice, temp_dir)
+            except Exception as exc:
+                logger.warning("TikWM direct download failed, falling back to yt-dlp: {}", exc)
+        url = _resolve_short_redirect(url)
+
+    # 2. Standard yt-dlp path (preferring native H.264/AAC to avoid CPU transcoding)
     ydl_opts = _build_base_ydl_opts()
     ydl_opts["outtmpl"] = str(temp_dir / "media_%(id)s.%(ext)s")
     ydl_opts["max_filesize"] = settings.max_file_size_bytes
@@ -527,7 +748,7 @@ def _sync_download_media(
     is_audio = choice == "audio"
 
     if is_audio:
-        ydl_opts["format"] = "bestaudio/best"
+        ydl_opts["format"] = "bestaudio[ext=m4a]/bestaudio/best"
         ydl_opts["postprocessors"] = [
             {
                 "key": "FFmpegExtractAudio",
@@ -540,26 +761,41 @@ def _sync_download_media(
         if choice in ("1080", "720", "480", "360"):
             h = int(choice)
             ydl_opts["format"] = (
+                f"bestvideo[height<={h}][vcodec^=avc]+bestaudio[acodec^=mp4a]/"
+                f"best[height<={h}][vcodec^=avc]/"
                 f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]/"
                 f"bestvideo[height<={h}]+bestaudio/"
                 f"best[height<={h}]/best"
             )
             quality_label = f"{h}p"
         else:
+            # Prefer native H.264 (avc1) stream first so Instagram/X/VK need zero re-encoding
             ydl_opts["format"] = (
+                "bestvideo[vcodec^=avc]+bestaudio[acodec^=mp4a]/"
+                "best[vcodec^=avc]/"
                 "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
                 "bestvideo+bestaudio/best"
             )
             quality_label = "HD"
 
-        # Prefer H.264 + AAC so merging to MP4 is fast and iOS/Android compatible
         ydl_opts["format_sort"] = ["vcodec:h264", "acodec:m4a", "res", "br"]
         ydl_opts["merge_output_format"] = "mp4"
         ydl_opts["postprocessor_args"] = {"ffmpeg": ["-movflags", "+faststart"]}
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+            info = None
+            if cached and cached.get("_engine") == "ytdlp" and cached.get("info"):
+                try:
+                    info_copy = dict(cached["info"])
+                    for key in ("requested_formats", "requested_downloads", "format", "format_id"):
+                        info_copy.pop(key, None)
+                    info = ydl.process_video_result(info_copy, download=True)
+                except Exception as cache_exc:
+                    logger.debug("Cached info download fallback to fresh extract: {}", cache_exc)
+                    info = None
+            if info is None:
+                info = ydl.extract_info(url, download=True)
     except Exception as exc:
         shutil.rmtree(temp_dir, ignore_errors=True)
         logger.error("Download error for {} (choice={}): {}", url, choice, exc)
@@ -570,7 +806,6 @@ def _sync_download_media(
         if entries:
             info = entries[0]
 
-    # Locate the downloaded output file inside temp_dir
     candidates = [
         p
         for p in temp_dir.iterdir()
@@ -582,7 +817,6 @@ def _sync_download_media(
             "⚠️ Не удалось сохранить медиафайл. Попробуйте другое качество."
         )
 
-    # Pick the largest produced file
     output_file = max(candidates, key=lambda p: p.stat().st_size)
 
     title = str((info or {}).get("title") or fallback_title).strip()
