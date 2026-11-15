@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import shutil
 import sys
+import time
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -22,6 +25,17 @@ from bot.handlers.admin import admin_router
 from bot.handlers.callbacks import callbacks_router
 from bot.handlers.user import user_router
 from bot.middlewares.throttling import ThrottlingMiddleware
+
+TDLIB_MEDIA_SUBDIRS = {
+    "videos",
+    "music",
+    "documents",
+    "temp",
+    "photos",
+    "voice",
+    "animations",
+    "video_notes",
+}
 
 
 def setup_logging() -> None:
@@ -60,6 +74,75 @@ def prepare_directories_and_assets() -> None:
             generate_banner_main()
         except Exception as exc:
             logger.warning("Failed to generate welcome banner on startup: {}", exc)
+
+
+def _purge_old_files_sync(max_age_tdlib_sec: int = 300, max_age_temp_sec: int = 1800) -> int:
+    """Remove cached media from local telegram-bot-api (TDLib) and stale temp folders.
+
+    Preserves TDLib binlog/sqlite state files while deleting uploaded video/audio copies.
+    """
+    now = time.time()
+    removed_bytes = 0
+
+    # 1. Clean TDLib cache directories (/var/lib/telegram-bot-api & ./data/telegram-bot-api-data)
+    tdlib_roots = [
+        Path("/var/lib/telegram-bot-api"),
+        settings.data_dir / "telegram-bot-api-data",
+    ]
+    seen_inodes: set[tuple[int, int]] = set()
+
+    for root in tdlib_roots:
+        if not root.exists():
+            continue
+        for subdir in root.rglob("*"):
+            if not subdir.is_dir() or subdir.name not in TDLIB_MEDIA_SUBDIRS:
+                continue
+            for file_path in subdir.rglob("*"):
+                if not file_path.is_file():
+                    continue
+                try:
+                    st = file_path.stat()
+                    inode_key = (st.st_dev, st.st_ino)
+                    if inode_key in seen_inodes:
+                        continue
+                    seen_inodes.add(inode_key)
+                    if now - st.st_mtime >= max_age_tdlib_sec:
+                        file_path.unlink(missing_ok=True)
+                        removed_bytes += st.st_size
+                except OSError:
+                    continue
+
+    # 2. Clean orphaned folders in data/temp_downloads older than 30 minutes
+    if settings.temp_downloads_dir.exists():
+        for entry in settings.temp_downloads_dir.iterdir():
+            try:
+                if now - entry.stat().st_mtime >= max_age_temp_sec:
+                    if entry.is_dir():
+                        shutil.rmtree(entry, ignore_errors=True)
+                    else:
+                        entry.unlink(missing_ok=True)
+            except OSError:
+                continue
+
+    return removed_bytes
+
+
+async def storage_cleanup_worker() -> None:
+    """Background task running every 5 minutes to prevent disk from filling up."""
+    while True:
+        try:
+            freed = await asyncio.to_thread(_purge_old_files_sync)
+            await db.prune_old_requests(hours=6)
+            if freed > 0:
+                logger.info(
+                    "Storage janitor freed {:.1f} MB from local Bot API cache",
+                    freed / (1024 * 1024),
+                )
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.warning("Storage cleanup worker error: {}", exc)
+        await asyncio.sleep(300)
 
 
 async def set_bot_commands(bot: Bot) -> None:
@@ -106,6 +189,7 @@ async def main() -> None:
     dp.include_router(user_router)
 
     await set_bot_commands(bot)
+    cleanup_task = asyncio.create_task(storage_cleanup_worker())
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)
@@ -113,6 +197,9 @@ async def main() -> None:
         logger.info("LissSave Bot started as @{} (id={})", me.username, me.id)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        cleanup_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await cleanup_task
         await bot.session.close()
         logger.info("LissSave Bot stopped cleanly")
 

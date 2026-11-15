@@ -234,6 +234,14 @@ class Database:
                 data["metadata"] = {}
             return data
 
+    async def prune_old_requests(self, hours: int = 6) -> None:
+        """Delete expired temporary URL metadata records to keep SQLite compact."""
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute(
+                f"DELETE FROM media_requests WHERE created_at < datetime('now', '-{int(hours)} hours');"
+            )
+            await conn.commit()
+
     async def get_statistics(self) -> BotStatistics:
         """Compute user and download statistics for the /admin dashboard."""
         async with aiosqlite.connect(self.db_path) as conn:

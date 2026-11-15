@@ -12,6 +12,11 @@ services:
       - ./data:/app/data
     expose:
       - "8081"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - lisssave-net
 
@@ -30,6 +35,11 @@ services:
     volumes:
       - ./data:/app/data
       - ./data/telegram-bot-api-data:/var/lib/telegram-bot-api
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - lisssave-net
 
